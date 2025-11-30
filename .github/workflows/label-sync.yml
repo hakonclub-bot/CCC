@@ -1,102 +1,51 @@
-name: Create and Sync PR Based on Label
+name: Create Sync PR Based on Label
 
 on:
   pull_request:
-    types: [labeled, synchronize]
+    types: [labeled]
 
 permissions:
-  pull-requests: write
   contents: write
+  pull-requests: write
 
 jobs:
   sync-pr:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.state == 'open'
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      #############################################################
-      # Detect label
-      #############################################################
-      - name: Detect label
-        id: detect
-        if: github.event.action == 'labeled'
-        run: echo "label=${{ github.event.label.name }}" >> $GITHUB_OUTPUT
-
-      #############################################################
-      # Determine target branch
-      #############################################################
-      - name: Determine target branch
-        id: target
-        if: github.event.action == 'labeled'
+      - name: Set target branch based on label
+        id: set-target
         run: |
-          case "${{ steps.detect.outputs.label }}" in
-            dev)   echo "branch=dev" >> $GITHUB_OUTPUT ;;
-            stage) echo "branch=stage" >> $GITHUB_OUTPUT ;;
-            *)     echo "branch=" >> $GITHUB_OUTPUT ;;
-          esac
+          if [ "${{ github.event.label.name }}" = "dev" ]; then
+            echo "target=dev" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.label.name }}" = "stage" ]; then
+            echo "target=stage" >> $GITHUB_OUTPUT
+          else
+            echo "target=" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Stop if no valid label
-        if: steps.target.outputs.branch == ''
-        run: echo "No valid sync label. Skipping."
+      - name: Stop if label is not dev or stage
+        if: steps.set-target.outputs.target == ''
+        run: echo "No matching label, exiting."
 
-      #############################################################
-      # Create Sync PR using GitHub API (ALWAYS WORKS)
-      #############################################################
       - name: Create Sync PR
-        id: syncpr
-        if: github.event.action == 'labeled' && steps.target.outputs.branch != ''
-        run: |
-          SYNC_BRANCH="sync/${{ github.event.pull_request.number }}-${{ steps.target.outputs.branch }}"
+        id: sync
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: "Sync PR → ${{ steps.set-target.outputs.target }}"
+          body: "Auto-created sync PR"
+          base: ${{ steps.set-target.outputs.target }}
+          branch: sync/${{ github.run_id }}-${{ steps.set-target.outputs.target }}
 
-          # Create sync branch
-          git checkout -B "$SYNC_BRANCH"
-          git push -f origin "$SYNC_BRANCH"
-
-          echo "Creating PR via API..."
-
-          RESPONSE=$(gh api repos/${{ github.repository }}/pulls \
-            -f title="Sync: ${{ github.event.pull_request.head.ref }} → ${{ steps.target.outputs.branch }}" \
-            -f head="$SYNC_BRANCH" \
-            -f base="${{ steps.target.outputs.branch }}" \
-            -f body="This Sync PR updates **${{ steps.target.outputs.branch }}** from feature PR #${{ github.event.pull_request.number }}")
-
-          URL=$(echo "$RESPONSE" | jq -r '.html_url')
-          echo "url=$URL" >> $GITHUB_OUTPUT
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-
-      #############################################################
-      # Comment Sync PR link on Main PR
-      #############################################################
-      - name: Comment with Sync PR link
-        if: steps.syncpr.outputs.url != ''
+      - name: Comment Sync PR Link
         uses: peter-evans/create-or-update-comment@v4
         with:
-          token: ${{ secrets.GH_PAT }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            🔄 A new **Sync PR** has been created!
-            **Target branch:** `${{ steps.target.outputs.branch }}`
-            👉 **Sync PR Link:** ${{ steps.syncpr.outputs.url }}
-
-            Merge this Sync PR to update `${{ steps.target.outputs.branch }}`.
-
-      #############################################################
-      # Auto-sync existing PR when feature PR gets new commits
-      #############################################################
-      - name: Auto update Sync PR on commit push
-        if: github.event.action == 'synchronize'
-        run: |
-          for target in dev stage; do
-            BRANCH="sync/${{ github.event.pull_request.number }}-$target"
-
-            if git ls-remote --exit-code origin "$BRANCH"; then
-              git push origin HEAD:"$BRANCH" -f
-              echo "Updated sync branch: $BRANCH"
-            fi
-          done
+            🔄 **Sync PR Created!**
+            **Target branch:** `${{ steps.set-target.outputs.target }}`
+            👉 **${{ steps.sync.outputs.pull_request_url }}**
