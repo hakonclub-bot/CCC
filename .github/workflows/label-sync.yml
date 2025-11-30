@@ -31,18 +31,27 @@ jobs:
             TARGET="$LABEL"
             SYNC_BRANCH="sync/${PR}-${TARGET}"
 
+            echo "Creating sync branch: $SYNC_BRANCH"
             git checkout "$SOURCE"
             git pull origin "$SOURCE"
             git checkout -b "$SYNC_BRANCH"
-
             git push -f origin "$SYNC_BRANCH"
 
-            gh pr create \
+            echo "Creating Sync PR..."
+            SYNC_PR_URL=$(gh pr create \
               --base "$TARGET" \
               --head "$SYNC_BRANCH" \
               --title "Sync: PR #$PR → $TARGET" \
-              --body "Auto sync created for PR #$PR" \
-              --label "sync" || echo "PR already exists"
+              --body "Auto sync PR created for original PR #$PR" \
+              --label "sync" \
+              --json url \
+              -q ".url")
+
+            echo "Sync PR created: $SYNC_PR_URL"
+
+            echo "Commenting Sync PR link on original PR..."
+            gh pr comment "$PR" --body "🔁 **Sync PR created:** $SYNC_PR_URL"
+
           else
             echo "Label is not dev or stage, skipping."
           fi
