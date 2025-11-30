@@ -27,24 +27,16 @@ jobs:
           PR="${{ github.event.pull_request.number }}"
           SOURCE="${{ github.event.pull_request.head.ref }}"
 
-          # only run on label 'dev' or 'stage'
           if [[ "$LABEL" == "dev" || "$LABEL" == "stage" ]]; then
             TARGET="$LABEL"
-
             SYNC_BRANCH="sync/${PR}-${TARGET}"
 
-            echo "Creating sync PR from $SOURCE → $TARGET"
-
-            # create new branch
             git checkout "$SOURCE"
             git pull origin "$SOURCE"
             git checkout -b "$SYNC_BRANCH"
 
-            # push sync branch
             git push -f origin "$SYNC_BRANCH"
 
-            # create PR using gh cli
-            echo "Creating Pull Request..."
             gh pr create \
               --base "$TARGET" \
               --head "$SYNC_BRANCH" \
@@ -52,5 +44,5 @@ jobs:
               --body "Auto sync created for PR #$PR" \
               --label "sync" || echo "PR already exists"
           else
-            echo "Label not dev or stage, skipping."
+            echo "Label is not dev or stage, skipping."
           fi
