@@ -48,4 +48,4 @@ jobs:
           body: |
             🔄 **Sync PR Created!**
             **Target branch:** `${{ steps.set-target.outputs.target }}`
-            👉 **${{ steps.sync.outputs.pull_request_url }}**
+            👉 ${{ steps.create_pr.outputs.pull_request_url }}
