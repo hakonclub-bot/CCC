@@ -21,7 +21,7 @@ jobs:
 
       - name: Create sync branch and PR
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           LABEL="${{ github.event.label.name }}"
           PR="${{ github.event.pull_request.number }}"
