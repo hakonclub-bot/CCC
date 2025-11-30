@@ -1,92 +1,147 @@
-name: Sync PR
+name: Sync PR (label -> create/update)
 
 on:
   pull_request:
-    types: [labeled, opened, synchronize]
-    branches:
-      - main
-      - release
-      - dev
+    types: [labeled, synchronize]
 
+# We use a PAT so explicit workflow permissions not required here
 jobs:
   sync-pr:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repo
+      - name: Checkout repo (fetch all refs)
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
 
-      - name: Read label to determine target
-        id: labels
-        run: |
-          echo "LABEL=$(echo '${{ github.event.pull_request.labels[*].name }}' | tr ' ' '\n' | head -n1)" >> $GITHUB_OUTPUT
+      - name: Setup GitHub CLI
+        uses: cli/cli@v3
 
-      - name: Determine target branch
-        id: target
+      - name: Authenticate GH CLI
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          if [[ "${{ steps.labels.outputs.LABEL }}" == "dev" ]]; then
-            echo "TARGET=dev" >> $GITHUB_OUTPUT
-          elif [[ "${{ steps.labels.outputs.LABEL }}" == "release" ]]; then
-            echo "TARGET=release" >> $GITHUB_OUTPUT
+          echo "$GH_PAT" | gh auth login --with-token
+
+      - name: Debug event info
+        run: |
+          echo "Event action: ${{ github.event.action }}"
+          echo "PR number: ${{ github.event.pull_request.number }}"
+          echo "Feature branch (head.ref): ${{ github.event.pull_request.head.ref }}"
+          echo "Repo: ${{ github.repository }}"
+
+      - name: If labeled -> detect label and target
+        id: detect
+        if: github.event.action == 'labeled'
+        run: |
+          LABEL="${{ github.event.label.name }}"
+          echo "label=$LABEL" >> $GITHUB_OUTPUT
+          if [ "$LABEL" = "dev" ]; then
+            echo "target=dev" >> $GITHUB_OUTPUT
+          elif [ "$LABEL" = "stage" ]; then
+            echo "target=stage" >> $GITHUB_OUTPUT
           else
-            echo "TARGET=none" >> $GITHUB_OUTPUT
+            echo "target=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Stop if invalid label
-        if: steps.target.outputs.TARGET == 'none'
-        run: echo "Invalid or missing sync label. Exiting."
-
-      - name: Create Sync Branch
-        if: steps.target.outputs.TARGET != 'none'
-        id: sync_branch
+      - name: Stop if no valid label (noop)
+        if: github.event.action == 'labeled' && steps.detect.outputs.target == ''
         run: |
-          SYNC_BRANCH="sync/${{ github.event.pull_request.head.ref }}-to-${{ steps.target.outputs.TARGET }}"
-          git fetch origin ${{ steps.target.outputs.TARGET }}
-          git checkout -B "$SYNC_BRANCH" origin/${{ steps.target.outputs.TARGET }}
-          git merge origin/${{ github.event.pull_request.head.ref }} --no-edit || true
-          git push -f origin "$SYNC_BRANCH"
-          echo "BRANCH=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+          echo "No dev/stage label detected. Exiting."
 
-      - name: Create Sync PR
-        id: create_sync_pr
-        if: steps.target.outputs.TARGET != 'none'
+      # -------------------------
+      # CREATE or UPDATE Sync PR
+      # -------------------------
+      - name: Create or update sync branch + PR
+        id: create_sync
+        if: github.event.action == 'labeled' && steps.detect.outputs.target != ''
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          RESP=$(gh pr create \
-            --title "Sync: ${{ github.event.pull_request.head.ref }} → ${{ steps.target.outputs.TARGET }}" \
-            --body "Auto sync PR created by bot." \
-            --base "${{ steps.target.outputs.TARGET }}" \
-            --head "${{ steps.sync_branch.outputs.BRANCH }}" \
-            --label "sync-pr" || true)
+          set -euo pipefail
+          FEATURE_REF="${{ github.event.pull_request.head.ref }}"
+          TARGET_REF="${{ steps.detect.outputs.target }}"
+          PR_NUM="${{ github.event.pull_request.number }}"
+          SYNC_BRANCH="sync/${PR_NUM}-${TARGET_REF}"
 
-          echo "RESP=$RESP"
+          echo "Feature: $FEATURE_REF"
+          echo "Target: $TARGET_REF"
+          echo "Sync branch: $SYNC_BRANCH"
 
-          # Extract PR URL
-          PR_URL=$(echo "$RESP" | grep -Eo "https://github.com[^ ]*")
-          
-          if [[ -z "$PR_URL" ]]; then
-            echo "ERROR: Could not extract PR URL"
-            echo "PR_URL=none" >> $GITHUB_OUTPUT
-          else
-            echo "PR_URL=$PR_URL" >> $GITHUB_OUTPUT
+          # Ensure we have remote refs for feature and target
+          git fetch origin "+refs/heads/${FEATURE_REF}:refs/remotes/origin/${FEATURE_REF}" || true
+          git fetch origin "+refs/heads/${TARGET_REF}:refs/remotes/origin/${TARGET_REF}" || true
+
+          # Create sync branch from feature branch (force update)
+          git checkout -B "$SYNC_BRANCH" "origin/${FEATURE_REF}"
+          git push -f "https://x-access-token:${GH_PAT}@github.com/${{ github.repository }}" "$SYNC_BRANCH":"$SYNC_BRANCH"
+
+          echo "Pushed sync branch: $SYNC_BRANCH"
+
+          # Create PR using gh; if exists, gh returns existing PR info
+          # Use --json to capture number and url reliably
+          PR_JSON=$(gh pr create --base "$TARGET_REF" --head "$SYNC_BRANCH" \
+            --title "Sync: ${FEATURE_REF} → ${TARGET_REF}" \
+            --body "Auto-created sync PR for feature PR #${PR_NUM}" \
+            --label "sync" --json number,url 2>/dev/null || true)
+
+          # If gh pr create returned empty (maybe PR existed), try to find existing one
+          if [ -z "$PR_JSON" ]; then
+            echo "gh pr create returned empty — searching for existing PR"
+            PR_JSON=$(gh pr list --head "${{ github.repository_owner }}:${SYNC_BRANCH}" --base "$TARGET_REF" --state open --json number,url --limit 1)
           fi
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
 
-      - name: Comment PR link on source PR
-        if: steps.create_sync_pr.outputs.PR_URL != 'none'
-        run: |
-          gh pr comment ${{ github.event.pull_request.number }} \
-           --body "🔄 **Sync PR Created**  
-           👉 ${{ steps.create_sync_pr.outputs.PR_URL }}"
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          echo "PR_JSON: $PR_JSON"
 
-      - name: Enable Auto-Sync on updates
-        if: steps.create_sync_pr.outputs.PR_URL != 'none'
-        run: |
-          PR_NUM=$(echo "${{ steps.create_sync_pr.outputs.PR_URL }}" | sed 's/.*pull\///')
-          gh pr merge --auto --rebase "$PR_NUM"
+          PR_NUMBER=$(echo "$PR_JSON" | jq -r '.[0].number // .number // empty')
+          PR_URL=$(echo "$PR_JSON" | jq -r '.[0].url // .url // empty')
+
+          # If still empty, fail with debug info
+          if [ -z "$PR_NUMBER" ] || [ -z "$PR_URL" ]; then
+            echo "ERROR: Could not create or locate PR. Dumping debug info:"
+            gh pr list --head "${{ github.repository_owner }}:${SYNC_BRANCH}" --base "$TARGET_REF" --state open --json number,url || true
+            exit 1
+          fi
+
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "sync_branch=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Comment Sync PR Link on original PR
+        if: github.event.action == 'labeled' && steps.create_sync.outputs.pr_url != ''
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          PR_URL="${{ steps.create_sync.outputs.pr_url }}"
+          ORIGIN_PR="${{ github.event.pull_request.number }}"
+          echo "Commenting on PR #$ORIGIN_PR with link $PR_URL"
+          gh pr comment "$ORIGIN_PR" --body "🔄 **Sync PR Created**\n\n**Target:** ${{ steps.detect.outputs.target }}\n👉 $PR_URL"
+
+      # -------------------------
+      # AUTO-UPDATE sync branch on new commits
+      # -------------------------
+      - name: Auto-update existing sync branch on new commits
+        if: github.event.action == 'synchronize'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          FEATURE_REF="${{ github.event.pull_request.head.ref }}"
+          PR_NUM="${{ github.event.pull_request.number }}"
+
+          for TARGET in dev stage; do
+            SYNC_BRANCH="sync/${PR_NUM}-${TARGET}"
+            echo "Checking for sync branch $SYNC_BRANCH"
+            if git ls-remote --exit-code origin "refs/heads/$SYNC_BRANCH"; then
+              echo "Sync branch exists; updating from feature $FEATURE_REF"
+              # Ensure we have feature ref
+              git fetch origin "+refs/heads/${FEATURE_REF}:refs/remotes/origin/${FEATURE_REF}" || true
+              # Force-update the sync branch from feature's remote ref:
+              git push -f "https://x-access-token:${GH_PAT}@github.com/${{ github.repository }}" "refs/remotes/origin/${FEATURE_REF}:refs/heads/${SYNC_BRANCH}"
+              echo "Updated $SYNC_BRANCH"
+            else
+              echo "No sync branch $SYNC_BRANCH; skipping"
+            fi
+          done
