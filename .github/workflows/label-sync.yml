@@ -1,11 +1,11 @@
-name: Sync PR
+name: Sync Branch on Label
 
 on:
   pull_request:
-    types: [labeled, synchronize]
+    types: [labeled]
 
 jobs:
-  sync-pr:
+  sync:
     runs-on: ubuntu-latest
 
 steps:
