@@ -1,0 +1,92 @@
+name: Sync PR
+
+on:
+  pull_request:
+    types: [labeled, opened, synchronize]
+    branches:
+      - main
+      - release
+      - dev
+
+jobs:
+  sync-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Read label to determine target
+        id: labels
+        run: |
+          echo "LABEL=$(echo '${{ github.event.pull_request.labels[*].name }}' | tr ' ' '\n' | head -n1)" >> $GITHUB_OUTPUT
+
+      - name: Determine target branch
+        id: target
+        run: |
+          if [[ "${{ steps.labels.outputs.LABEL }}" == "dev" ]]; then
+            echo "TARGET=dev" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.labels.outputs.LABEL }}" == "release" ]]; then
+            echo "TARGET=release" >> $GITHUB_OUTPUT
+          else
+            echo "TARGET=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Stop if invalid label
+        if: steps.target.outputs.TARGET == 'none'
+        run: echo "Invalid or missing sync label. Exiting."
+
+      - name: Create Sync Branch
+        if: steps.target.outputs.TARGET != 'none'
+        id: sync_branch
+        run: |
+          SYNC_BRANCH="sync/${{ github.event.pull_request.head.ref }}-to-${{ steps.target.outputs.TARGET }}"
+          git fetch origin ${{ steps.target.outputs.TARGET }}
+          git checkout -B "$SYNC_BRANCH" origin/${{ steps.target.outputs.TARGET }}
+          git merge origin/${{ github.event.pull_request.head.ref }} --no-edit || true
+          git push -f origin "$SYNC_BRANCH"
+          echo "BRANCH=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Create Sync PR
+        id: create_sync_pr
+        if: steps.target.outputs.TARGET != 'none'
+        run: |
+          RESP=$(gh pr create \
+            --title "Sync: ${{ github.event.pull_request.head.ref }} → ${{ steps.target.outputs.TARGET }}" \
+            --body "Auto sync PR created by bot." \
+            --base "${{ steps.target.outputs.TARGET }}" \
+            --head "${{ steps.sync_branch.outputs.BRANCH }}" \
+            --label "sync-pr" || true)
+
+          echo "RESP=$RESP"
+
+          # Extract PR URL
+          PR_URL=$(echo "$RESP" | grep -Eo "https://github.com[^ ]*")
+          
+          if [[ -z "$PR_URL" ]]; then
+            echo "ERROR: Could not extract PR URL"
+            echo "PR_URL=none" >> $GITHUB_OUTPUT
+          else
+            echo "PR_URL=$PR_URL" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Comment PR link on source PR
+        if: steps.create_sync_pr.outputs.PR_URL != 'none'
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+           --body "🔄 **Sync PR Created**  
+           👉 ${{ steps.create_sync_pr.outputs.PR_URL }}"
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Enable Auto-Sync on updates
+        if: steps.create_sync_pr.outputs.PR_URL != 'none'
+        run: |
+          PR_NUM=$(echo "${{ steps.create_sync_pr.outputs.PR_URL }}" | sed 's/.*pull\///')
+          gh pr merge --auto --rebase "$PR_NUM"
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
