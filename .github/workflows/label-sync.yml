@@ -8,49 +8,89 @@ jobs:
   sync:
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
+steps:
+  - name: Checkout repo
+    uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+      token: ${{ secrets.GH_PAT }}
 
-      - name: Setup Git credentials
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+  - name: Install jq
+    run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Create sync branch and PR
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          LABEL="${{ github.event.label.name }}"
-          PR="${{ github.event.pull_request.number }}"
-          SOURCE="${{ github.event.pull_request.head.ref }}"
+  - name: Detect target branch
+    id: detect
+    if: github.event.action == 'labeled'
+    run: |
+      LABEL="${{ github.event.label.name }}"
+      if [ "$LABEL" = "dev" ]; then
+        echo "target=dev" >> $GITHUB_OUTPUT
+      elif [ "$LABEL" = "stage" ]; then
+        echo "target=stage" >> $GITHUB_OUTPUT
+      else
+        echo "target=" >> $GITHUB_OUTPUT
+      fi
 
-          # only run on label 'dev' or 'stage'
-          if [[ "$LABEL" == "dev" || "$LABEL" == "stage" ]]; then
-            TARGET="$LABEL"
+  - name: Stop if label is invalid
+    if: github.event.action == 'labeled' && steps.detect.outputs.target == ''
+    run: exit 0
 
-            SYNC_BRANCH="sync/${PR}-${TARGET}"
+  - name: Create or Update Sync Branch and PR
+    id: sync
+    if: github.event.action == 'labeled'
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+    run: |
+      FEATURE="${{ github.event.pull_request.head.ref }}"
+      TARGET="${{ steps.detect.outputs.target }}"
+      PR_NUM="${{ github.event.pull_request.number }}"
+      SYNC_BRANCH="sync/${PR_NUM}-${TARGET}"
 
-            echo "Creating sync PR from $SOURCE → $TARGET"
+      git fetch origin
+      git checkout -B "$SYNC_BRANCH" "origin/$FEATURE"
+      git push -f "https://x-access-token:${GH_PAT}@github.com/${{ github.repository }}" "$SYNC_BRANCH"
 
-            # create new branch
-            git checkout "$SOURCE"
-            git pull origin "$SOURCE"
-            git checkout -b "$SYNC_BRANCH"
+      CREATE=$(gh pr create \
+        --base "$TARGET" \
+        --head "$SYNC_BRANCH" \
+        --title "Sync: $FEATURE → $TARGET" \
+        --body "Auto sync PR for #$PR_NUM" \
+        --label sync \
+        --json number,url 2>/dev/null || true)
 
-            # push sync branch
-            git push -f origin "$SYNC_BRANCH"
+      if [ -z "$CREATE" ]; then
+        CREATE=$(gh pr list \
+          --head "$SYNC_BRANCH" \
+          --base "$TARGET" \
+          --state open \
+          --json number,url \
+          --limit 1)
+      fi
 
-            # create PR using gh cli
-            echo "Creating Pull Request..."
-            gh pr create \
-              --base "$TARGET" \
-              --head "$SYNC_BRANCH" \
-              --title "Sync: PR #$PR → $TARGET" \
-              --body "Auto sync created for PR #$PR" \
-              --label "sync" || echo "PR already exists"
-          else
-            echo "Label not dev or stage, skipping."
-          fi
+      PR_URL=$(echo "$CREATE" | jq -r '.[0].url // .url')
+      echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+  - name: Comment back to original PR
+    if: steps.sync.outputs.pr_url != ''
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+    run: |
+      gh pr comment "${{ github.event.pull_request.number }}" \
+        --body "Sync PR created for target: ${{ steps.detect.outputs.target }}  
+
+  - name: Auto-update sync branches on synchronize
+    if: github.event.action == 'synchronize'
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+    run: |
+      PR="${{ github.event.pull_request.number }}"
+      FEATURE="${{ github.event.pull_request.head.ref }}"
+
+      for TARGET in dev stage; do
+        SYNC_BRANCH="sync/${PR}-${TARGET}"
+        if git ls-remote --exit-code origin "$SYNC_BRANCH" >/dev/null 2>&1; then
+          git fetch origin
+          git push -f "https://x-access-token:${GH_PAT}@github.com/${{ github.repository }}" \
+            "refs/remotes/origin/$FEATURE:refs/heads/$SYNC_BRANCH"
+        fi
+      done
